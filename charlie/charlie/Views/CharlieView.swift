@@ -14,6 +14,8 @@ struct CharlieView: View {
     @State private var showingReward = false
     @State private var rewardPhoto: CharliePhoto?
     @State private var lastRewardedSteps = 0
+    @State private var showingErrorAlert = false
+    @State private var successMessage: String?
     
     @FetchRequest(
         sortDescriptors: [NSSortDescriptor(keyPath: \Item.timestamp, ascending: false)],
@@ -57,6 +59,14 @@ struct CharlieView: View {
             }
             .navigationTitle("Charlie")
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    #if DEBUG
+                    DebugHealthPanel()
+                    #else
+                    EmptyView()
+                    #endif
+                }
+                
                 ToolbarItem(placement: .navigationBarTrailing) {
                     NavigationLink(destination: StatsView()) {
                         Image(systemName: "chart.bar.fill")
@@ -159,26 +169,92 @@ struct CharlieView: View {
     }
     
     private var authorizeButton: some View {
-        Button(action: {
-            Task {
-                try? await healthKit.requestAuthorization()
-            }
-        }) {
-            Label("Connect Health App", systemImage: "heart.fill")
+        VStack(spacing: 12) {
+            Button(action: {
+                Task {
+                    do {
+                        try await healthKit.requestAuthorization()
+                        successMessage = "✅ Health data connected successfully!"
+                        
+                        // Clear success message after 3 seconds
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                            successMessage = nil
+                        }
+                    } catch {
+                        showingErrorAlert = true
+                    }
+                }
+            }) {
+                HStack {
+                    if healthKit.isRequestingAuthorization {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            .scaleEffect(0.8)
+                        Text("Connecting...")
+                    } else {
+                        Label("Connect Health App", systemImage: "heart.fill")
+                    }
+                }
                 .frame(maxWidth: .infinity)
                 .padding()
-                .background(Color.blue)
+                .background(healthKit.isRequestingAuthorization ? Color.gray : Color.blue)
                 .foregroundColor(.white)
                 .cornerRadius(10)
+            }
+            .disabled(healthKit.isRequestingAuthorization)
+            
+            // Success message
+            if let message = successMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundColor(.green)
+                    .multilineTextAlignment(.center)
+                    .transition(.opacity)
+            }
+            
+            // Authorization status display
+            if healthKit.authorizationStatus == .sharingDenied {
+                VStack(spacing: 8) {
+                    Text("❌ Health access denied")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                    
+                    Text("Open Settings → Health → Data Access & Devices → Charlie → Turn on Step Count")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+            }
         }
         .padding(.horizontal)
+        .alert("Health Access Error", isPresented: $showingErrorAlert) {
+            Button("OK") { }
+            if let error = healthKit.authorizationError, error.recoverySuggestion != nil {
+                Button("Open Settings") {
+                    if let settingsUrl = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(settingsUrl)
+                    }
+                }
+            }
+        } message: {
+            VStack {
+                if let error = healthKit.authorizationError {
+                    Text(error.localizedDescription)
+                    if let suggestion = error.recoverySuggestion {
+                        Text("\n\(suggestion)")
+                    }
+                } else {
+                    Text("Unable to connect to HealthKit. Please try again.")
+                }
+            }
+        }
     }
     
     private func checkHealthKitAuthorization() {
-        if healthKit.authorizationStatus == .notDetermined {
-            Task {
-                try? await healthKit.requestAuthorization()
-            }
+        // Only check status, don't auto-request authorization
+        // Let user explicitly tap the button to request access
+        if healthKit.isAuthorized {
+            healthKit.startObservingSteps()
         }
     }
     

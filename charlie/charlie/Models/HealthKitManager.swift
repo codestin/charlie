@@ -2,62 +2,130 @@
 //  HealthKitManager.swift
 //  charlie
 //
-//  Created for Charlie - Your Virtual Walking Companion
+//  Real HealthKit implementation for device testing
 //
 
 import Foundation
 import HealthKit
 import Combine
 
-class HealthKitManager: ObservableObject {
-    static let shared = HealthKitManager()
-    
+class RealHealthKitManager: ObservableObject, HealthDataProviding {
     private let healthStore = HKHealthStore()
     private let stepType = HKQuantityType.quantityType(forIdentifier: .stepCount)!
     
     @Published var todaySteps: Int = 0
     @Published var isAuthorized = false
-    @Published var authorizationStatus: HKAuthorizationStatus = .notDetermined
+    @Published var authorizationError: HealthKitError?
+    @Published var isRequestingAuthorization = false
     
-    private var cancellables = Set<AnyCancellable>()
-    
-    private init() {
-        checkAuthorizationStatus()
+    var authorizationStatus: HealthAuthorizationStatus {
+        switch healthStore.authorizationStatus(for: stepType) {
+        case .notDetermined:
+            return .notDetermined
+        case .sharingDenied:
+            return .sharingDenied
+        case .sharingAuthorized:
+            return .sharingAuthorized
+        @unknown default:
+            return .unavailable
+        }
     }
     
-    func checkAuthorizationStatus() {
-        authorizationStatus = healthStore.authorizationStatus(for: stepType)
-        isAuthorized = authorizationStatus == .sharingAuthorized
+    private var observerQuery: HKObserverQuery?
+    private var cancellables = Set<AnyCancellable>()
+    
+    init() {
+        updateAuthorizationStatus()
+        if isAuthorized {
+            startObservingSteps()
+        }
+    }
+    
+    deinit {
+        if let query = observerQuery {
+            healthStore.stop(query)
+        }
+    }
+    
+    private func updateAuthorizationStatus() {
+        let status = healthStore.authorizationStatus(for: stepType)
+        DispatchQueue.main.async {
+            self.isAuthorized = status == .sharingAuthorized
+            self.authorizationError = nil
+        }
     }
     
     func requestAuthorization() async throws {
+        DispatchQueue.main.async {
+            self.isRequestingAuthorization = true
+            self.authorizationError = nil
+        }
+        
+        defer {
+            DispatchQueue.main.async {
+                self.isRequestingAuthorization = false
+            }
+        }
+        
         guard HKHealthStore.isHealthDataAvailable() else {
-            throw HealthKitError.healthDataNotAvailable
+            let error = HealthKitError.healthDataNotAvailable
+            DispatchQueue.main.async {
+                self.authorizationError = error
+            }
+            throw error
         }
         
         let types: Set = [stepType]
         
-        try await healthStore.requestAuthorization(toShare: [], read: types)
-        
-        await MainActor.run {
-            checkAuthorizationStatus()
-            if isAuthorized {
-                startObservingSteps()
+        do {
+            try await healthStore.requestAuthorization(toShare: [], read: types)
+            
+            await MainActor.run {
+                updateAuthorizationStatus()
+                
+                if !isAuthorized && authorizationStatus == .sharingDenied {
+                    authorizationError = HealthKitError.authorizationDenied
+                }
+                
+                if isAuthorized {
+                    startObservingSteps()
+                }
             }
+            
+        } catch {
+            let healthError = HealthKitError.unknownError(error)
+            DispatchQueue.main.async {
+                self.authorizationError = healthError
+            }
+            throw healthError
         }
     }
     
     func startObservingSteps() {
         fetchTodaySteps()
         
+        // Stop existing observer
+        if let existingQuery = observerQuery {
+            healthStore.stop(existingQuery)
+        }
+        
         // Set up background delivery for step updates
-        let query = HKObserverQuery(sampleType: stepType, predicate: nil) { [weak self] _, _, error in
+        observerQuery = HKObserverQuery(sampleType: stepType, predicate: nil) { [weak self] _, _, error in
             if error == nil {
                 self?.fetchTodaySteps()
             }
         }
         
-        healthStore.execute(query)
+        if let query = observerQuery {
+            healthStore.execute(query)
+            
+            // Enable background delivery
+            healthStore.enableBackgroundDelivery(for: stepType, frequency: .immediate) { success, error in
+                if let error = error {
+                    print("Failed to enable background delivery: \(error)")
+                }
+            }
+        }
     }
     
     func fetchTodaySteps() {
@@ -76,14 +144,15 @@ class HealthKitManager: ObservableObject {
             quantitySamplePredicate: predicate,
             options: .cumulativeSum
         ) { [weak self] _, result, error in
-            guard let result = result, let sum = result.sumQuantity() else {
+            if let error = error {
+                print("Error fetching today's steps: \(error)")
                 return
             }
             
-            let steps = Int(sum.doubleValue(for: HKUnit.count()))
+            let steps = result?.sumQuantity()?.doubleValue(for: HKUnit.count()) ?? 0
             
             DispatchQueue.main.async {
-                self?.todaySteps = steps
+                self?.todaySteps = Int(steps)
             }
         }
         
@@ -108,25 +177,15 @@ class HealthKitManager: ObservableObject {
                 options: .cumulativeSum
             ) { _, result, error in
                 if let error = error {
-                    continuation.resume(throwing: error)
+                    continuation.resume(throwing: HealthKitError.unknownError(error))
                     return
                 }
                 
-                guard let result = result, let sum = result.sumQuantity() else {
-                    continuation.resume(returning: 0)
-                    return
-                }
-                
-                let steps = Int(sum.doubleValue(for: HKUnit.count()))
-                continuation.resume(returning: steps)
+                let steps = result?.sumQuantity()?.doubleValue(for: HKUnit.count()) ?? 0
+                continuation.resume(returning: Int(steps))
             }
             
             healthStore.execute(query)
         }
     }
-}
-
-enum HealthKitError: Error {
-    case healthDataNotAvailable
-    case authorizationFailed
 }
